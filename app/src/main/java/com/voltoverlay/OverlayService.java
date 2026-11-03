@@ -151,7 +151,22 @@ public class OverlayService extends Service {
     private String readVoltage() {
         double v = fromSysfs();
         if (Double.isNaN(v)) v = fromBatteryApi();
-        return Double.isNaN(v) ? "-.-V" : String.format(Locale.US, "%.1fV", v);
+        if (Double.isNaN(v)) return "-.-V";
+Intent bi = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+int st = bi == null ? -1 : bi.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+String vs = String.format(Locale.US, "%.1fV", v);
+if (st == BatteryManager.BATTERY_STATUS_CHARGING) return vs + " \u26A1";
+double[] vt = {3.30, 3.50, 3.60, 3.70, 3.80, 3.90, 4.00, 4.20};
+double[] pt = {0, 10, 20, 38, 50, 65, 80, 100};
+int pct;
+if (v <= vt[0]) pct = 0;
+else if (v >= vt[vt.length - 1]) pct = 100;
+else {
+    int k = 1;
+    while (v > vt[k]) k++;
+    pct = (int) Math.round(pt[k - 1] + (pt[k] - pt[k - 1]) * (v - vt[k - 1]) / (vt[k] - vt[k - 1]));
+}
+return vs + " ~" + pct + "%";
     }
 
     /** Raw kernel reading. Usually microvolts, sometimes millivolts. */

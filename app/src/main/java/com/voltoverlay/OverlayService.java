@@ -151,7 +151,7 @@ public class OverlayService extends Service {
     private String readVoltage() {
         double v = fromSysfs();
         if (Double.isNaN(v)) v = fromBatteryApi();
-        return Double.isNaN(v) ? "-.--- V" : String.format(Locale.US, "%.3f V", v);
+        return Double.isNaN(v) ? "-.-V" : String.format(Locale.US, "%.1fV", v);
     }
 
     /** Raw kernel reading. Usually microvolts, sometimes millivolts. */

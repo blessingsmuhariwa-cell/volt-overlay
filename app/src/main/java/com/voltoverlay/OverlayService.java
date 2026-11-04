@@ -427,50 +427,5 @@ public class OverlayService extends Service {
     public IBinder onBind(Intent intent) {
         return null;
     }
-            }f (raw == Long.MIN_VALUE) return Double.NaN;
-        double mag = Math.abs((double) raw) / 1000.0;   // microamps -> milliamps
-        if (charging) return mag;
-        if (full) return 0;
-        return -mag;
-    }
-
-    /** Raw kernel voltage. Usually microvolts, sometimes millivolts. */
-    private double fromSysfs() {
-        for (String path : SYSFS_PATHS) {
-            try (BufferedReader r = new BufferedReader(new FileReader(path))) {
-                String s = r.readLine();
-                if (s == null) continue;
-                double raw = Double.parseDouble(s.trim());
-                if (raw <= 0) continue;
-                return raw > 100000 ? raw / 1e6 : raw / 1000.0;
-            } catch (Exception ignored) {
-                // file missing or blocked: try the next one
-            }
-        }
-        return Double.NaN;
-    }
-
-    /** Fallback: sticky battery broadcast, EXTRA_VOLTAGE is in millivolts. */
-    private double fromBatteryApi() {
-        Intent i = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
-        if (i == null) return Double.NaN;
-        int mv = i.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1);
-        return mv > 0 ? mv / 1000.0 : Double.NaN;
-    }
-
-    @Override
-    public void onDestroy() {
-        handler.removeCallbacks(tick);
-        save();
-        if (box != null && wm != null) {
-            try { wm.removeView(box); } catch (Exception ignored) { }
-            box = null;
-        }
-        super.onDestroy();
-    }
-
-    @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
-}
+                                        }
+                           

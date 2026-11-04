@@ -476,5 +476,29 @@ public class OverlayService extends Service {
     }
 
     /** Fallback: sticky battery broadcast, EXTRA_VOLTAGE is in millivolts. */
-    private double fromBatteryApi() {
-        Intent i = registe
+    private double fromBatteryApi() {        Intent i = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        if (i == null) return Double.NaN;
+        int mv = i.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1);
+        return mv > 0 ? mv / 1000.0 : Double.NaN;
+    }
+
+    @Override
+    public void onDestroy() {
+        handler.removeCallbacks(tick);
+        save();
+        if (userStop && prefs != null) {
+            // Stopped on purpose: this was not a shutdown
+            prefs.edit().putBoolean("running", false).putFloat("lowOcv", -1f).apply();
+        }
+        if (box != null && wm != null) {
+            try { wm.removeView(box); } catch (Exception ignored) { }
+            box = null;
+        }
+        super.onDestroy();
+    }
+
+    @Override
+    public IBinder onBind(Intent intent) {
+        return null;
+    }
+}

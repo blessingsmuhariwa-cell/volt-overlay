@@ -37,9 +37,10 @@ public class OverlayService extends Service {
 
     // ===== Tunables =====
     private static final double DEFAULT_CAPACITY_MAH = 5200; // starting guess; the app learns the real value
-    private static final double DEFAULT_EMPTY_V = 3.40;      // starting guess; the app learns the real value
+    private static final double DEFAULT_EMPTY_V = 3.49;      // measured at the first real shutdown; the app keeps refining it
     private static final double R_OHMS = 0.10;               // internal resistance (voltage sag per amp)
     private static final double CHARGE_EFFICIENCY = 0.97;    // share of charging current that is stored
+    private static final double SLEEP_MA = 15;               // typical drain while the phone sleeps
     private static final double[] VT = {3.40, 3.50, 3.60, 3.70, 3.80, 3.90, 4.00, 4.10, 4.20, 4.30, 4.35};
     private static final double[] PT = {0, 5, 12, 25, 41, 55, 67, 78, 88, 96, 100};
     // ====================
@@ -62,13 +63,22 @@ public class OverlayService extends Service {
     private double remainingMah = -1;      // charge left (mAh), -1 = unknown
     private double smoothV = Double.NaN;   // smoothed voltage (V)
     private double smoothI = Double.NaN;   // smoothed current (mA, + charging, - draining)
+    private int shownPct = -1;             // percentage on screen (moves 1% at a time)
     private long lastTickMs = 0;
     private long lastSaveMs = 0;
+    private int posX = -1;
+    private int posY = -1;
+
+    // Which sign of the raw current means "charging" on this phone (+1, -1, or 0 = not learned yet)
+    private int signConv = 0;
+    private int signCand = 0;
+    private int signVotes = 0;
 
     // Capacity-learning cycle: full -> unplug -> drain to near empty with no charging in between
     private boolean cycleArmed = false;
     private boolean cycleActive = false;
     private double cycleDrawnMah = 0;
+    private double cycleEstMah = 0;        // part of cycleDrawnMah that was estimated while asleep
 
     // Shutdown-voltage learning
     private boolean userStop = false;
@@ -78,7 +88,13 @@ public class OverlayService extends Service {
     private final Runnable tick = new Runnable() {
         @Override
         public void run() {
-            if (box != null) box.setText(update());
+            if (box != null) {
+                try {
+                    box.setText(update());
+                } catch (Exception e) {
+                    box.setText("err");
+                }
+            }
             handler.postDelayed(this, INTERVAL_MS);
         }
     };
@@ -91,13 +107,18 @@ public class OverlayService extends Service {
             return START_NOT_STICKY;
         }
         if (prefs == null) loadState();
-        startInForeground();
+        try {
+            startInForeground();
+        } catch (Exception e) {
+            stopSelf();
+            return START_NOT_STICKY;
+        }
         if (!Settings.canDrawOverlays(this)) {
             stopSelf();
             return START_NOT_STICKY;
         }
         if (box == null) addOverlay();
-        return START_NOT_STICKY;
+        return START_STICKY;
     }
 
     private void loadState() {
@@ -113,6 +134,10 @@ public class OverlayService extends Service {
         double ev = prefs.getFloat("emptyV", (float) DEFAULT_EMPTY_V);
         if (ev >= 3.10 && ev <= 3.55) emptyV = ev;
         shutdowns = prefs.getInt("shutdowns", 0);
+
+        signConv = prefs.getInt("sign", 0);
+        posX = prefs.getInt("x", -1);
+        posY = prefs.getInt("y", -1);
 
         // Did the phone die since the last run? (restarted without the Stop button being used)
         int bootNow = Settings.Global.getInt(getContentResolver(), Settings.Global.BOOT_COUNT, -2);
@@ -202,8 +227,8 @@ public class OverlayService extends Service {
                         | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
                 PixelFormat.TRANSLUCENT);
         lp.gravity = Gravity.TOP | Gravity.START;
-        lp.x = dp(12);
-        lp.y = dp(80);
+        lp.x = posX >= 0 ? posX : dp(12);
+        lp.y = posY >= 0 ? posY : dp(80);
 
         box.setOnTouchListener(new View.OnTouchListener() {
             int startX, startY;
@@ -223,6 +248,12 @@ public class OverlayService extends Service {
                         lp.y = startY + (int) (e.getRawY() - touchY);
                         wm.updateViewLayout(box, lp);
                         return true;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        if (prefs != null) {
+                            prefs.edit().putInt("x", lp.x).putInt("y", lp.y).apply();
+                        }
+                        return true;
                 }
                 return false;
             }
@@ -236,25 +267,37 @@ public class OverlayService extends Service {
     private String update() {
         double v = fromSysfs();
         if (Double.isNaN(v)) v = fromBatteryApi();
-        if (Double.isNaN(v)) return "-.-V";
+        if (Double.isNaN(v) || v < 2.5 || v > 5.0) return "-.-V";
 
         Intent bi = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
         int status = bi == null ? -1 : bi.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
-        boolean charging = status == BatteryManager.BATTERY_STATUS_CHARGING;
-        boolean full = status == BatteryManager.BATTERY_STATUS_FULL;
+        // "Plugged in" comes from the charger port, which is more trustworthy than the status field
+        boolean plugged = bi != null && bi.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0;
+        boolean full = plugged && status == BatteryManager.BATTERY_STATUS_FULL;
+        boolean statusCharging = status == BatteryManager.BATTERY_STATUS_CHARGING;
+        boolean charging = plugged && !full;
 
         smoothV = Double.isNaN(smoothV) ? v : smoothV + 0.15 * (v - smoothV);
 
-        double iMa = readCurrentMa(charging, full);
+        double iMa = readCurrentMa(plugged, statusCharging, full);
         if (!Double.isNaN(iMa)) {
             smoothI = Double.isNaN(smoothI) ? iMa : smoothI + 0.15 * (iMa - smoothI);
         }
 
+        // Time since the last tick. A long gap means the phone was asleep and ticks were paused.
         long now = SystemClock.elapsedRealtime();
-        // Missed ticks mean the count has a hole in it, so this cycle can't be used for learning
-        if (lastTickMs != 0 && now - lastTickMs > 5000) cycleActive = false;
-        double dtH = lastTickMs == 0 ? 0 : Math.min(now - lastTickMs, 120000L) / 3600000.0;
+        long gapMs = lastTickMs == 0 ? 0 : now - lastTickMs;
         lastTickMs = now;
+        double dtH;
+        double sleepMah = 0;
+        if (gapMs <= 5000) {
+            dtH = gapMs / 3600000.0;
+        } else if (!Double.isNaN(iMa) && iMa > 0) {
+            dtH = Math.min(gapMs, 1800000L) / 3600000.0;   // charging while asleep
+        } else {
+            dtH = 1.0 / 3600.0;
+            sleepMah = SLEEP_MA * Math.min(gapMs, 12 * 3600000L) / 3600000.0;   // quiet drain while asleep
+        }
 
         // Voltage estimate: add back the sag caused by the current, then use the table
         double iForV = Double.isNaN(smoothI) ? 0 : smoothI;
@@ -264,13 +307,13 @@ public class OverlayService extends Service {
 
         // Remember the last low resting voltage, in case the phone dies right after
         if (!Double.isNaN(iMa) && prefs != null) {
-            if (iMa < 0 && ocv < 3.70) {
+            if (!plugged && iMa < 0 && ocv < 3.70) {
                 if (now - lastLowWriteMs > 2000) {
                     prefs.edit().putFloat("lowOcv", (float) ocv).apply();
                     lastLowWriteMs = now;
                     lowRecorded = true;
                 }
-            } else if (lowRecorded && (charging || (iMa < 0 && ocv >= 3.80))) {
+            } else if (lowRecorded && (plugged || (iMa < 0 && ocv >= 3.80))) {
                 prefs.edit().putFloat("lowOcv", -1f).apply();
                 lowRecorded = false;
             }
@@ -283,6 +326,7 @@ public class OverlayService extends Service {
         } else {
             // Coulomb counting: charge in or out = current x time
             remainingMah += iMa * dtH * (iMa > 0 ? CHARGE_EFFICIENCY : 1.0);
+            remainingMah -= sleepMah;
             // Slow pull toward the voltage estimate to fix drift (stronger near empty)
             if (Math.abs(smoothI) < 1000) {
                 double k = ocv < lowKnee ? 0.02 : 0.001;
@@ -290,17 +334,19 @@ public class OverlayService extends Service {
             }
         }
 
-        // Learning cycle bookkeeping
-        if (!Double.isNaN(iMa)) {
-            if (iMa < 0) {
-                if (cycleArmed) {            // unplugged after a full charge: start counting
-                    cycleArmed = false;
-                    cycleActive = true;
-                    cycleDrawnMah = 0;
-                }
-                if (cycleActive) cycleDrawnMah += -iMa * dtH;
-            } else if (charging) {
-                cycleActive = false;         // charger plugged in mid-cycle: not a clean cycle
+        // Learning cycle bookkeeping (any time the charger is connected, the cycle is not clean)
+        if (plugged) {
+            cycleActive = false;
+        } else if (!Double.isNaN(iMa) && iMa < 0) {
+            if (cycleArmed) {                // unplugged after a full charge: start counting
+                cycleArmed = false;
+                cycleActive = true;
+                cycleDrawnMah = 0;
+                cycleEstMah = 0;
+            }
+            if (cycleActive) {
+                cycleDrawnMah += -iMa * dtH + sleepMah;
+                cycleEstMah += sleepMah;
             }
         }
 
@@ -312,23 +358,32 @@ public class OverlayService extends Service {
             cycleArmed = true;
             cycleActive = false;
             cycleDrawnMah = 0;
+            cycleEstMah = 0;
         }
 
         // Learn capacity: full -> (no charging) -> resting voltage reached the low knee
-        if (cycleActive && !Double.isNaN(iMa) && Math.abs(smoothI) < 1000 && ocv <= lowKnee) {
+        if (cycleActive && !Double.isNaN(iMa) && Math.abs(smoothI) < 1000 && ocv <= lowKnee
+                && cycleEstMah <= 0.4 * cycleDrawnMah) {
             learnCapacity(ocv);
         }
 
         remainingMah = Math.max(0, Math.min(capacityMah, remainingMah));
 
-        if (now - lastSaveMs > 30000) {
+        // Save often when the battery is low, so little is lost if the phone dies
+        int target = (int) Math.round(remainingMah / capacityMah * 100.0);
+        long saveEvery = target < 15 ? 5000 : 30000;
+        if (now - lastSaveMs > saveEvery) {
             save();
             lastSaveMs = now;
         }
 
-        int pct = (int) Math.round(remainingMah / capacityMah * 100.0);
-        String s = String.format(Locale.US, "%.1fV ~%d%%", smoothV, pct);
-        return charging ? s + " \u26A1" : s;
+        // Like a real gauge, the displayed percentage moves 1% at a time
+        if (shownPct < 0) shownPct = target;
+        else if (target > shownPct) shownPct++;
+        else if (target < shownPct) shownPct--;
+
+        String s = String.format(Locale.US, "%.1fV ~%d%%", smoothV, shownPct);
+        return plugged ? s + " \u26A1" : s;
     }
 
     /** Called when a clean full-to-low cycle finishes: measure the capacity and blend it in. */
@@ -373,15 +428,35 @@ public class OverlayService extends Service {
         return PT[k - 1] + (PT[k] - PT[k - 1]) * (v - VT[k - 1]) / (VT[k] - VT[k - 1]);
     }
 
-    /** Battery current in mA: positive while charging, negative while draining. */
-    private double readCurrentMa(boolean charging, boolean full) {
+    /** Battery current in mA: positive into the battery, negative out of it. */
+    private double readCurrentMa(boolean plugged, boolean statusCharging, boolean full) {
         if (bm == null) return Double.NaN;
         long raw = bm.getLongProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW);
         if (raw == Long.MIN_VALUE) return Double.NaN;
-        double mag = Math.abs((double) raw) / 1000.0;   // microamps -> milliamps
-        if (charging) return mag;
+        double ma = raw / 1000.0;                       // microamps -> milliamps
+        if (Math.abs(ma) > 8000) return Double.NaN;     // sensor glitch
+
+        // Learn which sign means "charging" on this phone, only when the charger clearly says so
+        if (plugged && statusCharging && Math.abs(ma) > 300) {
+            int cand = ma > 0 ? 1 : -1;
+            if (cand == signCand) {
+                signVotes++;
+            } else {
+                signCand = cand;
+                signVotes = 1;
+            }
+            if (signVotes >= 10 && signConv != cand) {
+                signConv = cand;
+                if (prefs != null) prefs.edit().putInt("sign", signConv).apply();
+            }
+        } else {
+            signVotes = 0;
+        }
+
         if (full) return 0;
-        return -mag;
+        if (signConv != 0) return ma * signConv;        // + = into the battery
+        double mag = Math.abs(ma);                      // not learned yet: trust the charger port
+        return plugged ? mag : -mag;
     }
 
     /** Raw kernel voltage. Usually microvolts, sometimes millivolts. */
@@ -402,30 +477,4 @@ public class OverlayService extends Service {
 
     /** Fallback: sticky battery broadcast, EXTRA_VOLTAGE is in millivolts. */
     private double fromBatteryApi() {
-        Intent i = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
-        if (i == null) return Double.NaN;
-        int mv = i.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1);
-        return mv > 0 ? mv / 1000.0 : Double.NaN;
-    }
-
-    @Override
-    public void onDestroy() {
-        handler.removeCallbacks(tick);
-        save();
-        if (userStop && prefs != null) {
-            // Stopped on purpose: this was not a shutdown
-            prefs.edit().putBoolean("running", false).putFloat("lowOcv", -1f).apply();
-        }
-        if (box != null && wm != null) {
-            try { wm.removeView(box); } catch (Exception ignored) { }
-            box = null;
-        }
-        super.onDestroy();
-    }
-
-    @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
-                                        }
-                           
+        Intent i = registe

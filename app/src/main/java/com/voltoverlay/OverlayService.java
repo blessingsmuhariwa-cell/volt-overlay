@@ -156,8 +156,8 @@ Intent bi = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGE
 int st = bi == null ? -1 : bi.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
 String vs = String.format(Locale.US, "%.1fV", v);
 if (st == BatteryManager.BATTERY_STATUS_CHARGING) return vs + " \u26A1";
-double[] vt = {3.30, 3.50, 3.60, 3.70, 3.80, 3.90, 4.00, 4.20};
-double[] pt = {0, 10, 20, 38, 50, 65, 80, 100};
+double[] vt = {3.40, 3.50, 3.60, 3.70, 3.80, 3.90, 4.00, 4.10, 4.20, 4.30, 4.35};
+double[] pt = {0, 5, 12, 25, 41, 55, 67, 78, 88, 96, 100};
 int pct;
 if (v <= vt[0]) pct = 0;
 else if (v >= vt[vt.length - 1]) pct = 100;

@@ -36,7 +36,7 @@ public class OverlayService extends Service {
     private static final long INTERVAL_MS = 1000;
 
     // ===== Tunables =====
-    private static final double DEFAULT_CAPACITY_MAH = 5200; // starting guess; the app learns the real value
+    private static final double DEFAULT_CAPACITY_MAH = 4900; // measured by the app in the first cycle (about 4880); it keeps refining it
     private static final double DEFAULT_EMPTY_V = 3.49;      // measured at the first real shutdown; the app keeps refining it
     private static final double R_OHMS = 0.10;               // internal resistance (voltage sag per amp)
     private static final double CHARGE_EFFICIENCY = 0.97;    // share of charging current that is stored
@@ -60,6 +60,7 @@ public class OverlayService extends Service {
     private double emptyV = DEFAULT_EMPTY_V;           // learned shutdown voltage
     private int learnedCycles = 0;
     private int shutdowns = 0;
+    private double lastDeathV = -1;       // last low voltage saved before a shutdown (shown for checking)
     private double remainingMah = -1;      // charge left (mAh), -1 = unknown
     private double smoothV = Double.NaN;   // smoothed voltage (V)
     private double smoothI = Double.NaN;   // smoothed current (mA, + charging, - draining)
@@ -132,8 +133,9 @@ public class OverlayService extends Service {
         learnedCycles = prefs.getInt("cycles", 0);
 
         double ev = prefs.getFloat("emptyV", (float) DEFAULT_EMPTY_V);
-        if (ev >= 3.10 && ev <= 3.55) emptyV = ev;
+        if (ev >= 3.10 && ev <= 3.62) emptyV = ev;
         shutdowns = prefs.getInt("shutdowns", 0);
+        lastDeathV = prefs.getFloat("lastDeathV", -1f);
 
         signConv = prefs.getInt("sign", 0);
         posX = prefs.getInt("x", -1);
@@ -145,10 +147,13 @@ public class OverlayService extends Service {
         float lowThen = prefs.getFloat("lowOcv", -1f);
         boolean wasRunning = prefs.getBoolean("running", false);
         if (wasRunning && bootNow != -2 && bootThen != -1 && bootNow != bootThen
-                && lowThen >= 3.10f && lowThen <= 3.55f) {
-            double w = shutdowns == 0 ? 0.7 : 0.3;
-            emptyV = (1 - w) * emptyV + w * lowThen;
-            shutdowns++;
+                && lowThen > 0) {
+            lastDeathV = lowThen;                      // shown in the notification for checking
+            if (lowThen >= 3.10f && lowThen <= 3.62f) {
+                double w = shutdowns == 0 ? 0.7 : 0.3;
+                emptyV = (1 - w) * emptyV + w * lowThen;
+                shutdowns++;
+            }
         }
         prefs.edit()
                 .putBoolean("running", true)
@@ -156,6 +161,7 @@ public class OverlayService extends Service {
                 .putFloat("lowOcv", -1f)
                 .putFloat("emptyV", (float) emptyV)
                 .putInt("shutdowns", shutdowns)
+                .putFloat("lastDeathV", (float) lastDeathV)
                 .apply();
 
         // Reuse the saved charge count if it is recent (under 10 minutes old)
@@ -175,7 +181,9 @@ public class OverlayService extends Service {
         String text = (learnedCycles == 0
                 ? String.format(Locale.US, "Capacity %.0f mAh (learning)", capacityMah)
                 : String.format(Locale.US, "Capacity %.0f mAh (%d cycles)", capacityMah, learnedCycles))
-                + String.format(Locale.US, " \u00B7 shuts down ~%.2fV", emptyV);
+                + String.format(Locale.US, " \u00B7 shuts down ~%.2fV", emptyV)
+                + (lastDeathV > 0
+                        ? String.format(Locale.US, " \u00B7 last died at %.2fV", lastDeathV) : "");
 
         return new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_lock_idle_charging)
@@ -476,7 +484,8 @@ public class OverlayService extends Service {
     }
 
     /** Fallback: sticky battery broadcast, EXTRA_VOLTAGE is in millivolts. */
-    private double fromBatteryApi() {        Intent i = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+    private double fromBatteryApi() {
+        Intent i = registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
         if (i == null) return Double.NaN;
         int mv = i.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1);
         return mv > 0 ? mv / 1000.0 : Double.NaN;

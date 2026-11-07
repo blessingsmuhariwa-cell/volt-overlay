@@ -27,6 +27,7 @@ import android.widget.TextView;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
+import java.util.Arrays;
 import java.util.Locale;
 
 public class OverlayService extends Service {
@@ -36,13 +37,15 @@ public class OverlayService extends Service {
     private static final long INTERVAL_MS = 1000;
 
     // ===== Tunables =====
-    private static final double DEFAULT_CAPACITY_MAH = 4900; // measured by the app in the first cycle (about 4880); it keeps refining it
-    private static final double DEFAULT_EMPTY_V = 3.49;      // measured at the first real shutdown; the app keeps refining it
+    // Set to true for ONE run to wipe everything the app has learned, then set it back to false.
+    private static final boolean RESET_LEARNING = false;
+    private static final double DEFAULT_CAPACITY_MAH = 4900; // starting value; the app learns the real one
+    private static final double DEFAULT_CUT_V = 3.45;        // starting guess for the loaded voltage where the phone shuts off
     private static final double R_OHMS = 0.10;               // internal resistance (voltage sag per amp)
     private static final double CHARGE_EFFICIENCY = 0.97;    // share of charging current that is stored
     private static final double SLEEP_MA = 15;               // typical drain while the phone sleeps
     private static final double[] VT = {3.40, 3.50, 3.60, 3.70, 3.80, 3.90, 4.00, 4.10, 4.20, 4.30, 4.35};
-    private static final double[] PT = {0, 5, 12, 25, 41, 55, 67, 78, 88, 96, 100};
+    private static final double[] PT_DEFAULT = {0, 5, 12, 25, 41, 55, 67, 78, 88, 96, 100};
     // ====================
 
     private static final String[] SYSFS_PATHS = {
@@ -57,10 +60,13 @@ public class OverlayService extends Service {
     private final Handler handler = new Handler(Looper.getMainLooper());
 
     private double capacityMah = DEFAULT_CAPACITY_MAH; // learned battery capacity
-    private double emptyV = DEFAULT_EMPTY_V;           // learned shutdown voltage
+    private double cutV = DEFAULT_CUT_V;               // learned loaded shutdown voltage
+    private double emptyV = DEFAULT_CUT_V + 0.04;      // resting voltage that counts as 0% at your usual load
+    private double typI = 400;                         // long-run average discharge current (mA)
+    private double[] pt = PT_DEFAULT.clone();          // learned voltage-to-percent curve
     private int learnedCycles = 0;
     private int shutdowns = 0;
-    private double lastDeathV = -1;       // last low voltage saved before a shutdown (shown for checking)
+    private double lastDeathV = -1;        // last raw voltage saved before a shutdown (shown for checking)
     private double remainingMah = -1;      // charge left (mAh), -1 = unknown
     private double smoothV = Double.NaN;   // smoothed voltage (V)
     private double smoothI = Double.NaN;   // smoothed current (mA, + charging, - draining)
@@ -75,16 +81,19 @@ public class OverlayService extends Service {
     private int signCand = 0;
     private int signVotes = 0;
 
-    // Capacity-learning cycle: full -> unplug -> drain to near empty with no charging in between
+    // Capacity and curve learning cycle: full -> unplug -> drain to near empty with no charging
     private boolean cycleArmed = false;
     private boolean cycleActive = false;
     private double cycleDrawnMah = 0;
     private double cycleEstMah = 0;        // part of cycleDrawnMah that was estimated while asleep
+    private final boolean[] crossed = new boolean[VT.length];
+    private final double[] drawnAt = new double[VT.length];
 
-    // Shutdown-voltage learning
+    // Shutdown learning
     private boolean userStop = false;
     private boolean lowRecorded = false;
     private long lastLowWriteMs = 0;
+    private double minVWindow = Double.MAX_VALUE;
 
     private final Runnable tick = new Runnable() {
         @Override
@@ -125,6 +134,7 @@ public class OverlayService extends Service {
     private void loadState() {
         bm = getSystemService(BatteryManager.class);
         prefs = getSharedPreferences("gauge", MODE_PRIVATE);
+        if (RESET_LEARNING) prefs.edit().clear().commit();
 
         double cap = prefs.getFloat("cap", (float) DEFAULT_CAPACITY_MAH);
         if (cap > 0.4 * DEFAULT_CAPACITY_MAH && cap < 1.2 * DEFAULT_CAPACITY_MAH) {
@@ -132,35 +142,36 @@ public class OverlayService extends Service {
         }
         learnedCycles = prefs.getInt("cycles", 0);
 
-        double ev = prefs.getFloat("emptyV", (float) DEFAULT_EMPTY_V);
-        if (ev >= 3.10 && ev <= 3.62) emptyV = ev;
-        shutdowns = prefs.getInt("shutdowns", 0);
+        double cv = prefs.getFloat("cutV", (float) DEFAULT_CUT_V);
+        if (cv >= 3.0 && cv <= 3.6) cutV = cv;
+        shutdowns = prefs.getInt("cutEvents", 0);
         lastDeathV = prefs.getFloat("lastDeathV", -1f);
 
         signConv = prefs.getInt("sign", 0);
         posX = prefs.getInt("x", -1);
         posY = prefs.getInt("y", -1);
+        loadCurve();
 
         // Did the phone die since the last run? (restarted without the Stop button being used)
         int bootNow = Settings.Global.getInt(getContentResolver(), Settings.Global.BOOT_COUNT, -2);
         int bootThen = prefs.getInt("boot", -1);
-        float lowThen = prefs.getFloat("lowOcv", -1f);
+        float lowThen = prefs.getFloat("lowV", -1f);
         boolean wasRunning = prefs.getBoolean("running", false);
         if (wasRunning && bootNow != -2 && bootThen != -1 && bootNow != bootThen
                 && lowThen > 0) {
             lastDeathV = lowThen;                      // shown in the notification for checking
-            if (lowThen >= 3.10f && lowThen <= 3.62f) {
+            if (lowThen >= 3.0f && lowThen <= 3.6f) {
                 double w = shutdowns == 0 ? 0.7 : 0.3;
-                emptyV = (1 - w) * emptyV + w * lowThen;
+                cutV = (1 - w) * cutV + w * lowThen;
                 shutdowns++;
             }
         }
         prefs.edit()
                 .putBoolean("running", true)
                 .putInt("boot", bootNow)
-                .putFloat("lowOcv", -1f)
-                .putFloat("emptyV", (float) emptyV)
-                .putInt("shutdowns", shutdowns)
+                .putFloat("lowV", -1f)
+                .putFloat("cutV", (float) cutV)
+                .putInt("cutEvents", shutdowns)
                 .putFloat("lastDeathV", (float) lastDeathV)
                 .apply();
 
@@ -171,6 +182,35 @@ public class OverlayService extends Service {
                 && System.currentTimeMillis() - savedAt < 10 * 60 * 1000L) {
             remainingMah = Math.min(saved, capacityMah);
         }
+        emptyV = Math.max(3.20, Math.min(3.62, cutV + R_OHMS * typI / 1000.0));
+    }
+
+    private void loadCurve() {
+        String s = prefs.getString("pt", null);
+        if (s == null) return;
+        try {
+            String[] parts = s.split(",");
+            if (parts.length != pt.length) return;
+            double[] tmp = new double[pt.length];
+            for (int k = 0; k < tmp.length; k++) tmp[k] = Double.parseDouble(parts[k]);
+            for (int k = 1; k < tmp.length; k++) {
+                if (tmp[k] <= tmp[k - 1]) return;
+            }
+            if (Math.abs(tmp[0]) > 0.01 || Math.abs(tmp[tmp.length - 1] - 100) > 0.01) return;
+            pt = tmp;
+        } catch (Exception ignored) {
+            // bad saved curve: keep the default one
+        }
+    }
+
+    private void saveCurve() {
+        if (prefs == null) return;
+        StringBuilder sb = new StringBuilder();
+        for (int k = 0; k < pt.length; k++) {
+            if (k > 0) sb.append(',');
+            sb.append(String.format(Locale.US, "%.2f", pt[k]));
+        }
+        prefs.edit().putString("pt", sb.toString()).apply();
     }
 
     private Notification buildNotification() {
@@ -307,23 +347,36 @@ public class OverlayService extends Service {
             sleepMah = SLEEP_MA * Math.min(gapMs, 12 * 3600000L) / 3600000.0;   // quiet drain while asleep
         }
 
-        // Voltage estimate: add back the sag caused by the current, then use the table
+        // Where 0% sits: the loaded shutdown voltage plus the sag at your usual (long-run) load
+        if (!plugged && !Double.isNaN(iMa) && iMa < 0 && gapMs <= 5000) {
+            typI += (-iMa - typI) / 900.0;
+            typI = Math.max(150, Math.min(900, typI));
+        }
+        emptyV = Math.max(3.20, Math.min(3.62, cutV + R_OHMS * typI / 1000.0));
+
+        // Voltage estimate: add back the sag caused by the current, then use the curve
         double iForV = Double.isNaN(smoothI) ? 0 : smoothI;
         double ocv = smoothV - (iForV / 1000.0) * R_OHMS;
         double estMah = pctFromVoltage(ocv) / 100.0 * capacityMah;
         double lowKnee = emptyV + 0.10;   // "nearly empty" voltage
 
-        // Remember the last low resting voltage, in case the phone dies right after
+        // Near empty on battery: keep noting the lowest raw voltage, in case the phone dies right after
         if (!Double.isNaN(iMa) && prefs != null) {
-            if (!plugged && iMa < 0 && ocv < 3.70) {
+            boolean nearEmpty = !plugged && iMa < 0 && shownPct >= 0 && shownPct < 20;
+            if (nearEmpty) {
+                minVWindow = Math.min(minVWindow, v);
                 if (now - lastLowWriteMs > 2000) {
-                    prefs.edit().putFloat("lowOcv", (float) ocv).apply();
+                    prefs.edit().putFloat("lowV", (float) minVWindow).apply();
                     lastLowWriteMs = now;
                     lowRecorded = true;
+                    minVWindow = Double.MAX_VALUE;
                 }
-            } else if (lowRecorded && (plugged || (iMa < 0 && ocv >= 3.80))) {
-                prefs.edit().putFloat("lowOcv", -1f).apply();
-                lowRecorded = false;
+            } else {
+                minVWindow = Double.MAX_VALUE;
+                if (lowRecorded && (plugged || (iMa < 0 && ocv >= 3.80))) {
+                    prefs.edit().putFloat("lowV", -1f).apply();
+                    lowRecorded = false;
+                }
             }
         }
 
@@ -351,10 +404,22 @@ public class OverlayService extends Service {
                 cycleActive = true;
                 cycleDrawnMah = 0;
                 cycleEstMah = 0;
+                Arrays.fill(crossed, false);
             }
             if (cycleActive) {
                 cycleDrawnMah += -iMa * dtH + sleepMah;
                 cycleEstMah += sleepMah;
+            }
+        }
+
+        // Curve learning: note how much charge was used when each table voltage is first passed
+        if (cycleActive && Math.abs(smoothI) < 1200) {
+            double vEff = tableV(ocv);
+            for (int k = 1; k < VT.length - 1; k++) {
+                if (!crossed[k] && vEff <= VT[k]) {
+                    crossed[k] = true;
+                    drawnAt[k] = cycleDrawnMah;
+                }
             }
         }
 
@@ -369,7 +434,7 @@ public class OverlayService extends Service {
             cycleEstMah = 0;
         }
 
-        // Learn capacity: full -> (no charging) -> resting voltage reached the low knee
+        // Learn: full -> (no charging) -> resting voltage reached the low knee
         if (cycleActive && !Double.isNaN(iMa) && Math.abs(smoothI) < 1000 && ocv <= lowKnee
                 && cycleEstMah <= 0.4 * cycleDrawnMah) {
             learnCapacity(ocv);
@@ -394,7 +459,7 @@ public class OverlayService extends Service {
         return plugged ? s + " \u26A1" : s;
     }
 
-    /** Called when a clean full-to-low cycle finishes: measure the capacity and blend it in. */
+    /** Called when a clean full-to-low cycle finishes: measure the capacity and the curve. */
     private void learnCapacity(double ocv) {
         double pctNow = pctFromVoltage(ocv);
         double frac = (100.0 - pctNow) / 100.0;   // share of capacity used since full
@@ -406,10 +471,33 @@ public class OverlayService extends Service {
             double w = learnedCycles == 0 ? 0.5 : 0.3;
             capacityMah = (1 - w) * capacityMah + w * measured;
             learnedCycles++;
+            learnCurve(measured);
             remainingMah = pctNow / 100.0 * capacityMah;
             save();
             getSystemService(NotificationManager.class).notify(1, buildNotification());
         }
+    }
+
+    /** Nudge each curve point toward the true percentage seen in this cycle. */
+    private void learnCurve(double measuredCap) {
+        boolean changed = false;
+        for (int k = 1; k < VT.length - 1; k++) {
+            if (!crossed[k]) continue;
+            double truth = 100.0 * (1.0 - drawnAt[k] / measuredCap);
+            truth = Math.max(0, Math.min(100, truth));
+            pt[k] += 0.25 * (truth - pt[k]);
+            pt[k] = Math.max(PT_DEFAULT[k] - 15, Math.min(PT_DEFAULT[k] + 15, pt[k]));
+            changed = true;
+        }
+        if (!changed) return;
+        // keep the curve rising from bottom to top
+        for (int k = 1; k < VT.length - 1; k++) {
+            if (pt[k] < pt[k - 1] + 0.5) pt[k] = pt[k - 1] + 0.5;
+        }
+        for (int k = VT.length - 2; k >= 1; k--) {
+            if (pt[k] > pt[k + 1] - 0.5) pt[k] = pt[k + 1] - 0.5;
+        }
+        saveCurve();
     }
 
     private void save() {
@@ -417,8 +505,8 @@ public class OverlayService extends Service {
         SharedPreferences.Editor ed = prefs.edit();
         ed.putFloat("cap", (float) capacityMah)
                 .putInt("cycles", learnedCycles)
-                .putFloat("emptyV", (float) emptyV)
-                .putInt("shutdowns", shutdowns);
+                .putFloat("cutV", (float) cutV)
+                .putInt("cutEvents", shutdowns);
         if (remainingMah >= 0) {
             ed.putFloat("mah", (float) remainingMah)
                     .putLong("savedAt", System.currentTimeMillis());
@@ -426,14 +514,19 @@ public class OverlayService extends Service {
         ed.apply();
     }
 
-    /** Voltage to percent. Below 3.70V the curve is stretched so emptyV maps to 0%. */
-    private double pctFromVoltage(double v) {
+    /** Below 3.70V the voltage is stretched so emptyV lines up with the bottom of the curve. */
+    private double tableV(double v) {
         if (v < 3.70) v = 3.40 + (v - emptyV) * (0.30 / (3.70 - emptyV));
+        return v;
+    }
+
+    private double pctFromVoltage(double v) {
+        v = tableV(v);
         if (v <= VT[0]) return 0;
         if (v >= VT[VT.length - 1]) return 100;
         int k = 1;
         while (v > VT[k]) k++;
-        return PT[k - 1] + (PT[k] - PT[k - 1]) * (v - VT[k - 1]) / (VT[k] - VT[k - 1]);
+        return pt[k - 1] + (pt[k] - pt[k - 1]) * (v - VT[k - 1]) / (VT[k] - VT[k - 1]);
     }
 
     /** Battery current in mA: positive into the battery, negative out of it. */
@@ -497,7 +590,7 @@ public class OverlayService extends Service {
         save();
         if (userStop && prefs != null) {
             // Stopped on purpose: this was not a shutdown
-            prefs.edit().putBoolean("running", false).putFloat("lowOcv", -1f).apply();
+            prefs.edit().putBoolean("running", false).putFloat("lowV", -1f).apply();
         }
         if (box != null && wm != null) {
             try { wm.removeView(box); } catch (Exception ignored) { }

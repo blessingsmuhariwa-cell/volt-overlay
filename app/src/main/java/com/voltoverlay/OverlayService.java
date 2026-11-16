@@ -40,7 +40,7 @@ public class OverlayService extends Service {
     // Set to true for ONE run to wipe everything the app has learned, then set it back to false.
     private static final boolean RESET_LEARNING = false;
     private static final double DEFAULT_CAPACITY_MAH = 4900; // starting value; the app learns the real one
-    private static final double DEFAULT_CUT_V = 3.45;        // starting guess for the loaded voltage where the phone shuts off
+    private static final double DEFAULT_CUT_V = 3.45;        // fixed safe empty point (loaded voltage). 0% means plug in now
     private static final double R_OHMS = 0.10;               // internal resistance (voltage sag per amp)
     private static final double CHARGE_EFFICIENCY = 0.97;    // share of charging current that is stored
     private static final double SLEEP_MA = 15;               // typical drain while the phone sleeps
@@ -55,6 +55,8 @@ public class OverlayService extends Service {
 
     private WindowManager wm;
     private TextView box;
+    private GradientDrawable bgDrawable;
+    private boolean isRed = false;
     private BatteryManager bm;
     private SharedPreferences prefs;
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -142,8 +144,6 @@ public class OverlayService extends Service {
         }
         learnedCycles = prefs.getInt("cycles", 0);
 
-        double cv = prefs.getFloat("cutV", (float) DEFAULT_CUT_V);
-        if (cv >= 3.0 && cv <= 3.6) cutV = cv;
         shutdowns = prefs.getInt("cutEvents", 0);
         lastDeathV = prefs.getFloat("lastDeathV", -1f);
 
@@ -159,12 +159,9 @@ public class OverlayService extends Service {
         boolean wasRunning = prefs.getBoolean("running", false);
         if (wasRunning && bootNow != -2 && bootThen != -1 && bootNow != bootThen
                 && lowThen > 0) {
-            lastDeathV = lowThen;                      // shown in the notification for checking
-            if (lowThen >= 3.0f && lowThen <= 3.6f) {
-                double w = shutdowns == 0 ? 0.7 : 0.3;
-                cutV = (1 - w) * cutV + w * lowThen;
-                shutdowns++;
-            }
+            // Only shown in the notification. A shutdown never moves the 0% point, because the
+            // phone's own cutoff is unsafe (it can die far below a healthy battery voltage).
+            lastDeathV = lowThen;
         }
         prefs.edit()
                 .putBoolean("running", true)
@@ -221,9 +218,9 @@ public class OverlayService extends Service {
         String text = (learnedCycles == 0
                 ? String.format(Locale.US, "Capacity %.0f mAh (learning)", capacityMah)
                 : String.format(Locale.US, "Capacity %.0f mAh (%d cycles)", capacityMah, learnedCycles))
-                + String.format(Locale.US, " \u00B7 shuts down ~%.2fV", emptyV)
+                + String.format(Locale.US, " \u00B7 0%% at ~%.2fV", emptyV)
                 + (lastDeathV > 0
-                        ? String.format(Locale.US, " \u00B7 last died at %.2fV", lastDeathV) : "");
+                        ? String.format(Locale.US, " \u00B7 last cut off at %.2fV", lastDeathV) : "");
 
         return new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_lock_idle_charging)
@@ -262,10 +259,10 @@ public class OverlayService extends Service {
         box.setTextSize(14);
         box.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         box.setPadding(dp(8), dp(4), dp(8), dp(4));
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(0xB3000000);
-        bg.setCornerRadius(dp(6));
-        box.setBackground(bg);
+        bgDrawable = new GradientDrawable();
+        bgDrawable.setColor(0xB3000000);
+        bgDrawable.setCornerRadius(dp(6));
+        box.setBackground(bgDrawable);
 
         final WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -454,6 +451,13 @@ public class OverlayService extends Service {
         if (shownPct < 0) shownPct = target;
         else if (target > shownPct) shownPct++;
         else if (target < shownPct) shownPct--;
+
+        // Red box at 15% or below while on battery
+        boolean wantRed = !plugged && shownPct <= 15;
+        if (wantRed != isRed && bgDrawable != null) {
+            isRed = wantRed;
+            bgDrawable.setColor(wantRed ? 0xE6C62828 : 0xB3000000);
+        }
 
         String s = String.format(Locale.US, "%.1fV ~%d%%", smoothV, shownPct);
         return plugged ? s + " \u26A1" : s;

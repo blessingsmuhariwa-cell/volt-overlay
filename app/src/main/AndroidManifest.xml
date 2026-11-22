@@ -8,7 +8,7 @@
 
     <application
         android:label="Volt Overlay"
-        android:theme="@android:style/Theme.DeviceDefault.Light">
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>

@@ -17,6 +17,7 @@ import android.os.BatteryManager;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.view.Gravity;
@@ -26,6 +27,7 @@ import android.view.WindowManager;
 import android.widget.TextView;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.FileReader;
 import java.util.Arrays;
 import java.util.Locale;
@@ -33,6 +35,7 @@ import java.util.Locale;
 public class OverlayService extends Service {
 
     static final String ACTION_STOP = "com.voltoverlay.STOP";
+    static final String ACTION_MOVE = "com.voltoverlay.MOVE";
     private static final String CHANNEL = "volt_overlay";
     private static final long INTERVAL_MS = 1000;
 
@@ -44,6 +47,7 @@ public class OverlayService extends Service {
     private static final double R_OHMS = 0.10;               // internal resistance (voltage sag per amp)
     private static final double CHARGE_EFFICIENCY = 0.97;    // share of charging current that is stored
     private static final double SLEEP_MA = 15;               // typical drain while the phone sleeps
+    static final double DESIGN_CAPACITY_MAH = 5100;      // rated capacity on the battery label; health = learned capacity / this
     private static final double[] VT = {3.40, 3.50, 3.60, 3.70, 3.80, 3.90, 4.00, 4.10, 4.20, 4.30, 4.35};
     private static final double[] PT_DEFAULT = {0, 5, 12, 25, 41, 55, 67, 78, 88, 96, 100};
     // ====================
@@ -97,12 +101,39 @@ public class OverlayService extends Service {
     private long lastLowWriteMs = 0;
     private double minVWindow = Double.MAX_VALUE;
 
+    // Click-through overlay: the Move action makes it draggable for 10 seconds
+    private WindowManager.LayoutParams overlayLp;
+    private boolean moveMode = false;
+    private long moveUntilMs = 0;
+
+    // Dashboard statistics. A "session" is the current on-battery (or charging) stretch.
+    private PowerManager pm;
+    private boolean sessionInit = false;
+    private boolean sessionPlugged = false;
+    private long sessionStartWall = 0;
+    private long sessionScreenMs = 0;
+    private int sessionStartPct = -1;
+    private double totalDischargedMah = 0;
+    private double drainEma = Double.NaN;      // recent average drain (mA), awake minutes
+    private double chargeEma = Double.NaN;     // recent average charge current (mA)
+    private long minuteStartMs = 0;
+    private double minuteDrawnMah = 0;
+    private double minuteAddedMah = 0;
+    private long lastHistoryWall = 0;
+    private long lastHistorySaveMs = 0;
+    private long restoredSessStart = 0;        // session saved by the previous run
+    private boolean restoredSessPlugged = false;
+    private long restoredSessScreen = 0;
+    private int restoredSessPct = -1;
+    private long restoredSessSavedAt = 0;
+
     private final Runnable tick = new Runnable() {
         @Override
         public void run() {
             if (box != null) {
                 try {
                     box.setText(update());
+                    if (moveMode && SystemClock.elapsedRealtime() > moveUntilMs) setTouchable(false);
                 } catch (Exception e) {
                     box.setText("err");
                 }
@@ -117,6 +148,11 @@ public class OverlayService extends Service {
             userStop = true;
             stopSelf();
             return START_NOT_STICKY;
+        }
+        if (intent != null && ACTION_MOVE.equals(intent.getAction()) && box != null) {
+            setTouchable(true);
+            moveUntilMs = SystemClock.elapsedRealtime() + 10000;
+            return START_STICKY;
         }
         if (prefs == null) loadState();
         try {
@@ -151,6 +187,15 @@ public class OverlayService extends Service {
         posX = prefs.getInt("x", -1);
         posY = prefs.getInt("y", -1);
         loadCurve();
+
+        pm = getSystemService(PowerManager.class);
+        totalDischargedMah = prefs.getFloat("totDis", 0f);
+        restoredSessStart = prefs.getLong("sessStart", 0);
+        restoredSessPlugged = prefs.getBoolean("sessPlug", false);
+        restoredSessScreen = prefs.getLong("sessScreen", 0);
+        restoredSessPct = prefs.getInt("sessPct", -1);
+        restoredSessSavedAt = prefs.getLong("sessSaved", 0);
+        History.load(new File(getFilesDir(), "history.csv"));
 
         // Did the phone die since the last run? (restarted without the Stop button being used)
         int bootNow = Settings.Global.getInt(getContentResolver(), Settings.Global.BOOT_COUNT, -2);
@@ -222,6 +267,10 @@ public class OverlayService extends Service {
                 + (lastDeathV > 0
                         ? String.format(Locale.US, " \u00B7 last cut off at %.2fV", lastDeathV) : "");
 
+        PendingIntent move = PendingIntent.getService(this, 1,
+                new Intent(this, OverlayService.class).setAction(ACTION_MOVE),
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+
         return new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_lock_idle_charging)
                 .setContentTitle("Voltage overlay running")
@@ -229,6 +278,9 @@ public class OverlayService extends Service {
                 .addAction(new Notification.Action.Builder(
                         Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
                         "Stop", stop).build())
+                .addAction(new Notification.Action.Builder(
+                        Icon.createWithResource(this, android.R.drawable.ic_menu_mylocation),
+                        "Move", move).build())
                 .setOngoing(true)
                 .build();
     }
@@ -269,11 +321,13 @@ public class OverlayService extends Service {
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
                 PixelFormat.TRANSLUCENT);
         lp.gravity = Gravity.TOP | Gravity.START;
         lp.x = posX >= 0 ? posX : dp(12);
         lp.y = posY >= 0 ? posY : dp(80);
+        overlayLp = lp;
 
         box.setOnTouchListener(new View.OnTouchListener() {
             int startX, startY;
@@ -308,6 +362,23 @@ public class OverlayService extends Service {
         handler.post(tick);
     }
 
+    /** Click-through by default; the "Move" notification action makes the box draggable for 10 seconds. */
+    private void setTouchable(boolean touchable) {
+        if (overlayLp == null || box == null || wm == null) return;
+        if (touchable) {
+            overlayLp.flags &= ~WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+        } else {
+            overlayLp.flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE;
+        }
+        moveMode = touchable;
+        if (bgDrawable != null) bgDrawable.setStroke(touchable ? dp(2) : 0, 0xFFFFFFFF);
+        try {
+            wm.updateViewLayout(box, overlayLp);
+        } catch (Exception ignored) {
+            // the box is already gone
+        }
+    }
+
     /** Runs once per second: reads sensors, updates the charge count, returns the text. */
     private String update() {
         double v = fromSysfs();
@@ -321,6 +392,13 @@ public class OverlayService extends Service {
         boolean full = plugged && status == BatteryManager.BATTERY_STATUS_FULL;
         boolean statusCharging = status == BatteryManager.BATTERY_STATUS_CHARGING;
         boolean charging = plugged && !full;
+        double tempC = Double.NaN;
+        int plugType = 0;
+        if (bi != null) {
+            int t = bi.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Integer.MIN_VALUE);
+            if (t != Integer.MIN_VALUE) tempC = t / 10.0;
+            plugType = bi.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
+        }
 
         smoothV = Double.isNaN(smoothV) ? v : smoothV + 0.15 * (v - smoothV);
 
@@ -333,6 +411,31 @@ public class OverlayService extends Service {
         long now = SystemClock.elapsedRealtime();
         long gapMs = lastTickMs == 0 ? 0 : now - lastTickMs;
         lastTickMs = now;
+        long wall = System.currentTimeMillis();
+
+        // A new session starts whenever the charger is plugged in or removed
+        if (!sessionInit || plugged != sessionPlugged) {
+            boolean restore = !sessionInit && restoredSessStart > 0 && restoredSessPlugged == plugged
+                    && wall - restoredSessSavedAt < 30 * 60 * 1000L;
+            sessionInit = true;
+            sessionPlugged = plugged;
+            if (restore) {
+                sessionStartWall = restoredSessStart;
+                sessionScreenMs = restoredSessScreen;
+                sessionStartPct = restoredSessPct;
+            } else {
+                sessionStartWall = wall;
+                sessionScreenMs = 0;
+                sessionStartPct = -1;        // filled in below once the percentage is known
+            }
+            drainEma = Double.NaN;
+            chargeEma = Double.NaN;
+            minuteStartMs = now;
+            minuteDrawnMah = 0;
+            minuteAddedMah = 0;
+        }
+        if (gapMs <= 5000 && pm != null && pm.isInteractive()) sessionScreenMs += gapMs;
+
         double dtH;
         double sleepMah = 0;
         if (gapMs <= 5000) {
@@ -390,6 +493,35 @@ public class OverlayService extends Service {
                 double k = ocv < lowKnee ? 0.02 : 0.001;
                 remainingMah += (estMah - remainingMah) * k;
             }
+        }
+
+        // Statistics for the dashboard: charge drawn and added, averaged per minute
+        if (!Double.isNaN(iMa)) {
+            if (iMa < 0) {
+                double used = -iMa * dtH + sleepMah;
+                minuteDrawnMah += used;
+                totalDischargedMah += used;
+            } else if (iMa > 0) {
+                minuteAddedMah += iMa * dtH;
+            }
+        }
+        long minElapsed = now - minuteStartMs;
+        if (minElapsed >= 60000) {
+            // A long gap means the phone slept, so it says little about how hard it is used
+            if (minElapsed <= 180000) {
+                double hrs = minElapsed / 3600000.0;
+                double wgt = Math.min(1.0, 0.1 * minElapsed / 60000.0);
+                if (!plugged) {
+                    double rate = minuteDrawnMah / hrs;
+                    drainEma = Double.isNaN(drainEma) ? rate : drainEma + wgt * (rate - drainEma);
+                } else if (charging) {
+                    double rate = minuteAddedMah / hrs;
+                    chargeEma = Double.isNaN(chargeEma) ? rate : chargeEma + wgt * (rate - chargeEma);
+                }
+            }
+            minuteStartMs = now;
+            minuteDrawnMah = 0;
+            minuteAddedMah = 0;
         }
 
         // Learning cycle bookkeeping (any time the charger is connected, the cycle is not clean)
@@ -459,8 +591,70 @@ public class OverlayService extends Service {
             bgDrawable.setColor(wantRed ? 0xE6C62828 : 0xB3000000);
         }
 
+        if (sessionStartPct < 0 && shownPct >= 0) sessionStartPct = shownPct;
+
+        // One history point per minute for the graph; saved to a file every 10 minutes
+        if (lastHistoryWall == 0 || wall - lastHistoryWall >= 60000) {
+            History.add(wall, shownPct, (float) smoothV, plugged);
+            lastHistoryWall = wall;
+        }
+        if (now - lastHistorySaveMs > 600000) {
+            History.save(new File(getFilesDir(), "history.csv"));
+            lastHistorySaveMs = now;
+        }
+
+        // Time estimates: recent drain blended with the whole session's average drain
+        double drain = Double.isNaN(drainEma) ? typI : drainEma;
+        if (!plugged && sessionStartPct >= 0) {
+            double sessHours = (wall - sessionStartWall) / 3600000.0;
+            double sessUsedMah = Math.max(0, sessionStartPct - shownPct) / 100.0 * capacityMah;
+            if (sessHours > 0.5 && sessUsedMah > 50) {
+                drain = 0.5 * drain + 0.5 * (sessUsedMah / sessHours);
+            }
+        }
+        drain = Math.max(30, drain);
+        double above15 = remainingMah - 0.15 * capacityMah;
+        LiveData.hoursTo0 = plugged ? Double.NaN : remainingMah / drain;
+        LiveData.hoursTo15 = (!plugged && above15 > 0) ? above15 / drain : Double.NaN;
+        LiveData.hoursToFull = charging ? hoursToFull(chargeEma) : Double.NaN;
+
+        // Publish for the dashboard
+        LiveData.running = true;
+        LiveData.updatedMs = now;
+        LiveData.volts = smoothV;
+        LiveData.currentMa = smoothI;
+        LiveData.tempC = tempC;
+        LiveData.pct = shownPct;
+        LiveData.plugged = plugged;
+        LiveData.charging = charging;
+        LiveData.full = full;
+        LiveData.plugType = plugType;
+        LiveData.sessionStartWall = sessionStartWall;
+        LiveData.screenOnMs = sessionScreenMs;
+        LiveData.sessionStartPct = sessionStartPct;
+        LiveData.avgDrainMa = drain;
+        LiveData.capacityMah = capacityMah;
+        LiveData.learnedCycles = learnedCycles;
+        LiveData.equivCycles = totalDischargedMah / capacityMah;
+        LiveData.remainingMah = remainingMah;
+        LiveData.emptyV = emptyV;
+
         String s = String.format(Locale.US, "%.1fV ~%d%%", smoothV, shownPct);
         return plugged ? s + " \u26A1" : s;
+    }
+
+    /** Rough time to full: constant current up to about 80%, then a slower tapering top-up. */
+    private double hoursToFull(double chgMa) {
+        double cc = Double.isNaN(chgMa) ? smoothI : chgMa;
+        if (Double.isNaN(cc) || cc < 50) return Double.NaN;
+        double eff = cc * CHARGE_EFFICIENCY;
+        double need = capacityMah - remainingMah;
+        if (need <= 0) return 0;
+        double knee = 0.80 * capacityMah;
+        if (remainingMah >= knee) return need / (0.6 * eff);       // already tapering
+        double fast = (knee - remainingMah) / eff;                // constant-current part
+        double slow = (capacityMah - knee) / (0.5 * eff);         // tapering part, about half speed
+        return fast + slow;
     }
 
     /** Called when a clean full-to-low cycle finishes: measure the capacity and the curve. */
@@ -510,7 +704,15 @@ public class OverlayService extends Service {
         ed.putFloat("cap", (float) capacityMah)
                 .putInt("cycles", learnedCycles)
                 .putFloat("cutV", (float) cutV)
-                .putInt("cutEvents", shutdowns);
+                .putInt("cutEvents", shutdowns)
+                .putFloat("totDis", (float) totalDischargedMah);
+        if (sessionInit) {
+            ed.putLong("sessStart", sessionStartWall)
+                    .putBoolean("sessPlug", sessionPlugged)
+                    .putLong("sessScreen", sessionScreenMs)
+                    .putInt("sessPct", sessionStartPct)
+                    .putLong("sessSaved", System.currentTimeMillis());
+        }
         if (remainingMah >= 0) {
             ed.putFloat("mah", (float) remainingMah)
                     .putLong("savedAt", System.currentTimeMillis());
@@ -592,6 +794,8 @@ public class OverlayService extends Service {
     public void onDestroy() {
         handler.removeCallbacks(tick);
         save();
+        LiveData.running = false;
+        History.save(new File(getFilesDir(), "history.csv"));
         if (userStop && prefs != null) {
             // Stopped on purpose: this was not a shutdown
             prefs.edit().putBoolean("running", false).putFloat("lowV", -1f).apply();
